@@ -83,10 +83,25 @@ func (bf *BidirectionalFinder) FindShortestPath(target string) (*SearchResult, e
             }
 
             // Expand forward - respect tier hierarchy
-            possibleRecipes := bf.getPossibleRecipesThatRespectTiers(current, currentTier)
+            possibleRecipes := bf.getValidRecipesWithElementAnyPosition(current)
             for _, recipe := range possibleRecipes {
                 resultElem := recipe.Result
                 resultTier := bf.store.GetElementTier(resultElem)
+                
+                // Check if ALL ingredients have lower tier than the result
+                allIngredientsLowerTier := true
+                for _, ingredient := range recipe.Ingredients {
+                    ingredientTier := bf.store.GetElementTier(ingredient)
+                    if ingredientTier >= resultTier {
+                        allIngredientsLowerTier = false
+                        break
+                    }
+                }
+                
+                // Only process recipes where all ingredients have lower tiers than result
+                if !allIngredientsLowerTier {
+                    continue
+                }
                 
                 // Only consider recipes that lead to higher tiers
                 if resultTier <= currentTier {
@@ -134,7 +149,22 @@ func (bf *BidirectionalFinder) FindShortestPath(target string) (*SearchResult, e
             // In backward search, we're looking for ingredients of current element
             for _, recipe := range bf.store.Recipes {
                 if recipe.Result == current {
-                    // For each ingredient, check tier constraints
+                    // Check if all ingredients have lower tier than result (current)
+                    allIngredientsLowerTier := true
+                    for _, ingredient := range recipe.Ingredients {
+                        ingredientTier := bf.store.GetElementTier(ingredient)
+                        if ingredientTier >= currentTier {
+                            allIngredientsLowerTier = false
+                            break
+                        }
+                    }
+                    
+                    // Skip recipes that don't satisfy tier constraints
+                    if !allIngredientsLowerTier {
+                        continue
+                    }
+                    
+                    // For each ingredient, process if it meets tier constraints
                     for _, ingredient := range recipe.Ingredients {
                         ingredientTier := bf.store.GetElementTier(ingredient)
                         
@@ -196,9 +226,9 @@ func (bf *BidirectionalFinder) FindShortestPath(target string) (*SearchResult, e
     }, nil
 }
 
-// FindMultiplePaths finds multiple recipe paths
+// FindMultiplePaths finds multiple recipe paths using multithreading
 func (bf *BidirectionalFinder) FindMultiplePaths(target string, maxPaths int) ([]*SearchResult, error) {
-    // Check target
+    // Check target exists
     _, exists := bf.store.Elements[target]
     if !exists {
         return nil, ErrElementNotFound
@@ -208,17 +238,24 @@ func (bf *BidirectionalFinder) FindMultiplePaths(target string, maxPaths int) ([
     var mutex sync.Mutex
     var wg sync.WaitGroup
 
-    // Limit goroutines
-    maxGoroutines := 4
+    // Limit goroutines based on available CPUs
+    maxGoroutines := 4 // Can be adjusted based on system cores
     if maxGoroutines > maxPaths {
         maxGoroutines = maxPaths
     }
 
-    // Concurrency control
+    // Channel for concurrency control
     sem := make(chan bool, maxGoroutines)
     
-    // Start multiple searches
-    for i := 0; i < maxPaths; i++ {
+    // Channel to collect found paths
+    foundPaths := make(chan *SearchResult, maxPaths)
+    
+    // Stop signal for goroutines when we've found enough paths
+    done := make(chan bool)
+    pathsFound := 0
+    
+    // Start multiple searches with different variations
+    for i := 0; i < maxPaths*2; i++ { // Try more variations than needed
         wg.Add(1)
         sem <- true
         
@@ -226,18 +263,85 @@ func (bf *BidirectionalFinder) FindMultiplePaths(target string, maxPaths int) ([
             defer wg.Done()
             defer func() { <-sem }()
             
-            // Find variation path
-            result, err := bf.findPathWithVariation(target, index)
-            
-            if err == nil {
-                mutex.Lock()
-                results = append(results, result)
-                mutex.Unlock()
+            // Create variation of finder parameters based on index
+            select {
+            case <-done:
+                return // Stop if we've found enough paths
+            default:
+                // Find variation path with different criteria
+                result, err := bf.findPathWithVariation(target, index)
+                
+                if err == nil && result != nil {
+                    // Verify the path is valid (all ingredients have lower tier than results)
+                    isValid := true
+                    for _, recipe := range result.Path {
+                        resultTier := bf.store.GetElementTier(recipe.Result)
+                        
+                        for _, ingredient := range recipe.Ingredients {
+                            ingredientTier := bf.store.GetElementTier(ingredient)
+                            if ingredientTier >= resultTier {
+                                isValid = false
+                                break
+                            }
+                        }
+                        
+                        if !isValid {
+                            break
+                        }
+                    }
+                    
+                    if isValid {
+                        // Check if we already have this path (deduplicate)
+                        isDuplicate := false
+                        
+                        mutex.Lock()
+                        for _, existingResult := range results {
+                            if len(existingResult.Path) == len(result.Path) {
+                                // Simple equality check - could be more sophisticated
+                                sameSteps := true
+                                for i, recipe := range existingResult.Path {
+                                    if recipe.Result != result.Path[i].Result {
+                                        sameSteps = false
+                                        break
+                                    }
+                                }
+                                
+                                if sameSteps {
+                                    isDuplicate = true
+                                    break
+                                }
+                            }
+                        }
+                        mutex.Unlock()
+                        
+                        if !isDuplicate {
+                            foundPaths <- result
+                        }
+                    }
+                }
             }
         }(i)
     }
     
+    // Collect results in a separate goroutine
+    go func() {
+        for result := range foundPaths {
+            mutex.Lock()
+            if pathsFound < maxPaths {
+                results = append(results, result)
+                pathsFound++
+                
+                if pathsFound >= maxPaths {
+                    close(done) // Signal other goroutines to stop
+                }
+            }
+            mutex.Unlock()
+        }
+    }()
+    
+    // Wait for all searches to complete
     wg.Wait()
+    close(foundPaths)
     
     // Check results
     if len(results) == 0 {
@@ -247,39 +351,41 @@ func (bf *BidirectionalFinder) FindMultiplePaths(target string, maxPaths int) ([
     return results, nil
 }
 
-// Get recipes using element that respect tier hierarchy
-func (bf *BidirectionalFinder) getPossibleRecipesThatRespectTiers(elementID string, currentTier int) []Recipe {
+// Get valid recipes that contain the given element in any position
+// and respect tier constraints
+func (bf *BidirectionalFinder) getValidRecipesWithElementAnyPosition(elementID string) []Recipe {
     var recipes []Recipe
 
+    // Find recipes where the element is used as an ingredient
     for _, recipe := range bf.store.Recipes {
+        // Check if this element is one of the ingredients
+        isIngredient := false
         for _, ingredient := range recipe.Ingredients {
             if ingredient == elementID {
-                // Check if the result tier is higher than current tier
-                resultTier := bf.store.GetElementTier(recipe.Result)
-                if resultTier > currentTier {
-                    recipes = append(recipes, recipe)
+                isIngredient = true
+                break
+            }
+        }
+        
+        if isIngredient {
+            // Verify tier constraints - all ingredients must have lower tier than result
+            resultTier := bf.store.GetElementTier(recipe.Result)
+            allIngredientsLowerTier := true
+            
+            for _, ingredient := range recipe.Ingredients {
+                ingredientTier := bf.store.GetElementTier(ingredient)
+                if ingredientTier >= resultTier {
+                    allIngredientsLowerTier = false
+                    break
                 }
-                break
             }
-        }
-    }
-
-    return recipes
-}
-
-// Get all recipes using element (without tier restriction)
-func (bf *BidirectionalFinder) getPossibleRecipesWith(elementID string) []Recipe {
-    var recipes []Recipe
-    
-    for _, recipe := range bf.store.Recipes {
-        for _, ingredient := range recipe.Ingredients {
-            if ingredient == elementID {
+            
+            if allIngredientsLowerTier {
                 recipes = append(recipes, recipe)
-                break
             }
         }
     }
-    
+
     return recipes
 }
 
@@ -292,6 +398,22 @@ func (bf *BidirectionalFinder) reconstructForwardPath(meetingPoint string, paren
         step, exists := parentMap[current]
         if !exists {
             break // Reached basic element
+        }
+        
+        // Verify tier constraints for the recipe
+        resultTier := bf.store.GetElementTier(step.Recipe.Result)
+        allIngredientsLowerTier := true
+        
+        for _, ingredient := range step.Recipe.Ingredients {
+            ingredientTier := bf.store.GetElementTier(ingredient)
+            if ingredientTier >= resultTier {
+                allIngredientsLowerTier = false
+                break
+            }
+        }
+        
+        if !allIngredientsLowerTier {
+            break // Skip invalid recipe
         }
         
         path = append([]Recipe{step.Recipe}, path...) // Prepend
@@ -312,6 +434,22 @@ func (bf *BidirectionalFinder) reconstructBackwardPath(meetingPoint string, chil
             break
         }
         
+        // Verify tier constraints for the recipe
+        resultTier := bf.store.GetElementTier(step.Recipe.Result)
+        allIngredientsLowerTier := true
+        
+        for _, ingredient := range step.Recipe.Ingredients {
+            ingredientTier := bf.store.GetElementTier(ingredient)
+            if ingredientTier >= resultTier {
+                allIngredientsLowerTier = false
+                break
+            }
+        }
+        
+        if !allIngredientsLowerTier {
+            break // Skip invalid recipe
+        }
+        
         path = append(path, step.Recipe) // Append
         current = step.ParentID
     }
@@ -319,16 +457,317 @@ func (bf *BidirectionalFinder) reconstructBackwardPath(meetingPoint string, chil
     return path
 }
 
-// Find variant path
+// Find variant path with different search parameters
 func (bf *BidirectionalFinder) findPathWithVariation(target string, variationIndex int) (*SearchResult, error) {
-    result, err := bf.FindShortestPath(target)
+    startTime := time.Now()
+
+    // Modify search parameters based on variation index
+    // This creates different search patterns to find varied paths
     
-    if err == nil && result != nil {
-        // Add variation marker
-        result.VariationIndex = variationIndex
+    // Different variations:
+    // - Use different subsets of basic elements as starting points
+    // - Modify tier prioritization
+    // - Use different randomization seeds for recipe order
+    
+    // For simplicity, we'll implement a basic variation using
+    // different starting elements and search bias
+    
+    // Check target exists
+    _, exists := bf.store.Elements[target]
+    if !exists {
+        return nil, ErrElementNotFound
     }
+    targetTier := bf.store.GetElementTier(target)
+
+    // Get basic elements
+    basicElements := bf.store.GetBasicElements()
+    if len(basicElements) == 0 {
+        return nil, ErrNoBasicElements
+    }
+
+    // Count visited nodes
+    visitedCount := 0
+
+    // Forward search setup with variation
+    forwardQueue := list.New()
+    forwardVisited := make(map[string]bool)
+    forwardParent := make(map[string]RecipeStep) // Parent tracking
+    forwardTier := make(map[string]int)         // Track tier for each element in forward search
+
+    // Use variation index to select different starting elements
+    startOffset := variationIndex % len(basicElements)
+    elemCount := len(basicElements)
     
-    return result, err
+    // Add basic elements in different order based on variation
+    for i := 0; i < elemCount; i++ {
+        elemIndex := (startOffset + i) % elemCount
+        elem := basicElements[elemIndex]
+        
+        forwardQueue.PushBack(elem.ID)
+        forwardVisited[elem.ID] = true
+        forwardTier[elem.ID] = 0
+        visitedCount++
+    }
+
+    // Backward search setup
+    backwardQueue := list.New()
+    backwardVisited := make(map[string]bool)
+    backwardParent := make(map[string]RecipeStep) // Child tracking
+    backwardTier := make(map[string]int)         // Track tier for each element in backward search
+
+    // Init backward queue
+    backwardQueue.PushBack(target)
+    backwardVisited[target] = true
+    backwardTier[target] = targetTier
+    visitedCount++
+
+    // Meeting point
+    var meetingPoint string
+    found := false
+    
+    // Set variation-specific depth limit to avoid too deep searches
+    maxIterations := 1000 + (variationIndex % 500) // Vary max iterations
+    iterations := 0
+
+    // Run bidirectional BFS with tier constraints
+    for forwardQueue.Len() > 0 && backwardQueue.Len() > 0 && !found && iterations < maxIterations {
+        iterations++
+        
+        // Forward search step with extra randomization based on variation index
+        doBackwardFirst := (variationIndex % 2 == 1) // Alternate search direction
+        
+        if !doBackwardFirst {
+            // Forward search
+            levelSize := forwardQueue.Len()
+            for i := 0; i < levelSize && !found; i++ {
+                current := forwardQueue.Remove(forwardQueue.Front()).(string)
+                currentTier := forwardTier[current]
+                
+                // Check meeting point
+                if backwardVisited[current] {
+                    meetingPoint = current
+                    found = true
+                    break
+                }
+                
+                // Expand forward with tier constraints
+                possibleRecipes := bf.getValidRecipesWithElementAnyPosition(current)
+                
+                // Process recipes in different orders based on variation
+                offset := variationIndex % len(possibleRecipes)
+                if offset > 0 && len(possibleRecipes) > 1 {
+                    possibleRecipes = append(possibleRecipes[offset:], possibleRecipes[:offset]...)
+                }
+                
+                for _, recipe := range possibleRecipes {
+                    resultElem := recipe.Result
+                    resultTier := bf.store.GetElementTier(resultElem)
+                    
+                    // Verify tier constraints
+                    allIngredientsLowerTier := true
+                    for _, ingredient := range recipe.Ingredients {
+                        ingredientTier := bf.store.GetElementTier(ingredient)
+                        if ingredientTier >= resultTier {
+                            allIngredientsLowerTier = false
+                            break
+                        }
+                    }
+                    
+                    if !allIngredientsLowerTier || resultTier <= currentTier {
+                        continue
+                    }
+                    
+                    if !forwardVisited[resultElem] {
+                        forwardQueue.PushBack(resultElem)
+                        forwardVisited[resultElem] = true
+                        forwardTier[resultElem] = resultTier
+                        forwardParent[resultElem] = RecipeStep{
+                            ParentID: current,
+                            Recipe:   recipe,
+                        }
+                        visitedCount++
+                        
+                        if backwardVisited[resultElem] {
+                            meetingPoint = resultElem
+                            found = true
+                            break
+                        }
+                    }
+                }
+            }
+        }
+        
+        if found {
+            break
+        }
+        
+        // Backward search step
+        levelSize := backwardQueue.Len()
+        for i := 0; i < levelSize && !found; i++ {
+            current := backwardQueue.Remove(backwardQueue.Front()).(string)
+            currentTier := backwardTier[current]
+            
+            if forwardVisited[current] {
+                meetingPoint = current
+                found = true
+                break
+            }
+            
+            // Process recipes in different order based on variation
+            relevantRecipes := []Recipe{}
+            for _, recipe := range bf.store.Recipes {
+                if recipe.Result == current {
+                    relevantRecipes = append(relevantRecipes, recipe)
+                }
+            }
+            
+            // Vary recipe order
+            offset := variationIndex % len(relevantRecipes)
+            if offset > 0 && len(relevantRecipes) > 1 {
+                relevantRecipes = append(relevantRecipes[offset:], relevantRecipes[:offset]...)
+            }
+            
+            for _, recipe := range relevantRecipes {
+                // Check tier constraints
+                allIngredientsLowerTier := true
+                for _, ingredient := range recipe.Ingredients {
+                    ingredientTier := bf.store.GetElementTier(ingredient)
+                    if ingredientTier >= currentTier {
+                        allIngredientsLowerTier = false
+                        break
+                    }
+                }
+                
+                if !allIngredientsLowerTier {
+                    continue
+                }
+                
+                // Process ingredients differently based on variation
+                processOrder := recipe.Ingredients
+                if variationIndex%2 == 1 && len(processOrder) > 1 {
+                    // Reverse ingredient processing order in odd variations
+                    processOrder = []string{processOrder[1], processOrder[0]}
+                }
+                
+                for _, ingredient := range processOrder {
+                    ingredientTier := bf.store.GetElementTier(ingredient)
+                    
+                    if ingredientTier >= currentTier {
+                        continue
+                    }
+                    
+                    if !backwardVisited[ingredient] {
+                        backwardQueue.PushBack(ingredient)
+                        backwardVisited[ingredient] = true
+                        backwardTier[ingredient] = ingredientTier
+                        backwardParent[ingredient] = RecipeStep{
+                            ParentID: current,
+                            Recipe:   recipe,
+                        }
+                        visitedCount++
+                        
+                        if forwardVisited[ingredient] {
+                            meetingPoint = ingredient
+                            found = true
+                            break
+                        }
+                    }
+                }
+                
+                if found {
+                    break
+                }
+            }
+        }
+        
+        // If we did forward search first, now do backward
+        if doBackwardFirst {
+            // Forward search (same code as above)
+            levelSize := forwardQueue.Len()
+            for i := 0; i < levelSize && !found; i++ {
+                current := forwardQueue.Remove(forwardQueue.Front()).(string)
+                currentTier := forwardTier[current]
+                
+                // Check meeting point
+                if backwardVisited[current] {
+                    meetingPoint = current
+                    found = true
+                    break
+                }
+                
+                // Expand forward with tier constraints
+                possibleRecipes := bf.getValidRecipesWithElementAnyPosition(current)
+                
+                // Process recipes in different orders based on variation
+                offset := variationIndex % len(possibleRecipes)
+                if offset > 0 && len(possibleRecipes) > 1 {
+                    possibleRecipes = append(possibleRecipes[offset:], possibleRecipes[:offset]...)
+                }
+                
+                for _, recipe := range possibleRecipes {
+                    resultElem := recipe.Result
+                    resultTier := bf.store.GetElementTier(resultElem)
+                    
+                    // Verify tier constraints
+                    allIngredientsLowerTier := true
+                    for _, ingredient := range recipe.Ingredients {
+                        ingredientTier := bf.store.GetElementTier(ingredient)
+                        if ingredientTier >= resultTier {
+                            allIngredientsLowerTier = false
+                            break
+                        }
+                    }
+                    
+                    if !allIngredientsLowerTier || resultTier <= currentTier {
+                        continue
+                    }
+                    
+                    if !forwardVisited[resultElem] {
+                        forwardQueue.PushBack(resultElem)
+                        forwardVisited[resultElem] = true
+                        forwardTier[resultElem] = resultTier
+                        forwardParent[resultElem] = RecipeStep{
+                            ParentID: current,
+                            Recipe:   recipe,
+                        }
+                        visitedCount++
+                        
+                        if backwardVisited[resultElem] {
+                            meetingPoint = resultElem
+                            found = true
+                            break
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if !found {
+        return nil, ErrNoPathFound
+    }
+
+    // Build path
+    forwardPath := bf.reconstructForwardPath(meetingPoint, forwardParent)
+    backwardPath := bf.reconstructBackwardPath(meetingPoint, backwardParent)
+
+    // Combine paths
+    var completePath []Recipe
+    completePath = append(completePath, forwardPath...)
+    completePath = append(completePath, backwardPath...)
+
+    // Visualize tree
+    treeStructure := bf.buildTreeStructure(completePath, target)
+
+    executionTime := time.Since(startTime).Milliseconds()
+
+    return &SearchResult{
+        Path:          completePath,
+        VisitedNodes:  visitedCount,
+        ExecutionTime: executionTime,
+        TreeStructure: treeStructure,
+        VariationIndex: variationIndex,
+    }, nil
 }
 
 // Create visualization tree

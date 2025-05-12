@@ -110,18 +110,31 @@ func NewElementStore(jsonFile string) (*ElementStore, error) {
             // Process recipes
             for _, ingredients := range elem.Recipes {
                 if len(ingredients) == 2 {
-                    recipe := Recipe{
-                        Ingredients: ingredients,
-                        Result:      elem.ID,
+                    // Check if both ingredients have a lower tier than the result
+                    allLowerTier := true
+                    for _, ingredient := range ingredients {
+                        ingTier, exists := store.TierMap[ingredient]
+                        if !exists || ingTier >= group.TierNum {
+                            allLowerTier = false
+                            break
+                        }
                     }
-                    store.Recipes = append(store.Recipes, recipe)
+                    
+                    // Only add valid recipes where all ingredients have lower tier
+                    if allLowerTier {
+                        recipe := Recipe{
+                            Ingredients: ingredients,
+                            Result:      elem.ID,
+                        }
+                        store.Recipes = append(store.Recipes, recipe)
+                    }
                 }
             }
         }
     }
 
     // Log summary
-    log.Printf("Loaded %d elements with %d recipes", len(store.Elements), len(store.Recipes))
+    log.Printf("Loaded %d elements with %d valid recipes", len(store.Elements), len(store.Recipes))
     log.Printf("Basic elements (tier 0): %v", store.BasicElements)
 
     return store, nil
@@ -157,6 +170,23 @@ func (es *ElementStore) GetElementTier(elementID string) int {
     return tier
 }
 
+// ValidateTierConstraint checks if all ingredients have lower tier than the result
+func (es *ElementStore) ValidateTierConstraint(ingredients []string, result string) bool {
+    resultTier, exists := es.TierMap[result]
+    if !exists {
+        return false
+    }
+    
+    for _, ingredient := range ingredients {
+        ingredientTier, exists := es.TierMap[ingredient]
+        if !exists || ingredientTier >= resultTier {
+            return false
+        }
+    }
+    
+    return true
+}
+
 // ListAvailableElements prints a sample of available elements
 func ListAvailableElements(store *ElementStore, maxSample int) {
     fmt.Println("\nSome available elements:")
@@ -186,6 +216,25 @@ func PrintRecipePath(algorithmName string, result *SearchResult, store *ElementS
             recipe.Ingredients[0], tier1,
             recipe.Ingredients[1], tier2,
             recipe.Result, resultTier)
+    }
+}
+
+// PrintMultipleRecipePaths prints multiple recipe paths
+func PrintMultipleRecipePaths(algorithmName string, results []*SearchResult, store *ElementStore) {
+    fmt.Printf("\n%s Found %d Different Paths:\n", algorithmName, len(results))
+    
+    for i, result := range results {
+        fmt.Printf("\nPath %d (Length: %d, Visited nodes: %d):\n", i+1, len(result.Path), result.VisitedNodes)
+        for j, recipe := range result.Path {
+            tier1 := store.GetElementTier(recipe.Ingredients[0])
+            tier2 := store.GetElementTier(recipe.Ingredients[1])
+            resultTier := store.GetElementTier(recipe.Result)
+            fmt.Printf("  %d: %s (T%d) + %s (T%d) → %s (T%d)\n", 
+                j+1, 
+                recipe.Ingredients[0], tier1,
+                recipe.Ingredients[1], tier2,
+                recipe.Result, resultTier)
+        }
     }
 }
 
@@ -429,6 +478,37 @@ func main() {
         os.Exit(1)
     }
 
+    // Toggle between single recipe and multiple recipes
+    fmt.Println("\nSearch mode:")
+    fmt.Println("1. Find shortest recipe path")
+    fmt.Println("2. Find multiple recipe paths")
+    fmt.Print("Enter your choice (1-2): ")
+    
+    searchMode, err := reader.ReadString('\n')
+    if err != nil {
+        log.Fatalf("Error reading input: %v", err)
+    }
+    searchMode = strings.TrimSpace(searchMode)
+
+    // Variable for max paths if multiple recipe search is chosen
+    maxPaths := 5 // Default value
+    
+    if searchMode == "2" {
+        fmt.Print("\nEnter maximum number of recipe paths to find: ")
+        maxPathsInput, err := reader.ReadString('\n')
+        if err != nil {
+            log.Fatalf("Error reading input: %v", err)
+        }
+        
+        // Parse max paths input
+        fmt.Sscanf(strings.TrimSpace(maxPathsInput), "%d", &maxPaths)
+        if maxPaths < 1 {
+            maxPaths = 1
+        } else if maxPaths > 20 {
+            maxPaths = 20 // Limit to prevent excessive computation
+        }
+    }
+
     // Get algorithm choice from user
     fmt.Println("\nSelect algorithm to use:")
     fmt.Println("1. Breadth-First Search (BFS)")
@@ -445,79 +525,161 @@ func main() {
     fmt.Printf("\nSearching for recipes to create: %s (Tier %d)\n", 
         target, store.GetElementTier(target))
 
-    // Execute the chosen algorithm
-    switch algoChoice {
-    case "1":
-        // Run BFS search
-        fmt.Println("\nRunning BFS search...")
-        startTime := time.Now()
-        bfs := NewBreadthFirstFinder(store)
-        bfsResult, err := bfs.FindShortestPath(target)
-        searchDuration := time.Since(startTime)
-        
-        if err != nil {
-            fmt.Printf("BFS Error: %v\n", err)
-        } else {
-            fmt.Printf("\nBFS found a path with %d steps!\n", len(bfsResult.Path))
-            fmt.Printf("Visited %d nodes during search\n", bfsResult.VisitedNodes)
-            fmt.Printf("Algorithm execution time: %d ms\n", bfsResult.ExecutionTime)
-            fmt.Printf("Total execution time: %v\n", searchDuration)
+    // Execute the chosen algorithm based on search mode
+    if searchMode == "1" {
+        // Single recipe path search
+        switch algoChoice {
+        case "1":
+            // Run BFS search
+            fmt.Println("\nRunning BFS search...")
+            startTime := time.Now()
+            bfs := NewBreadthFirstFinder(store)
+            bfsResult, err := bfs.FindShortestPath(target)
+            searchDuration := time.Since(startTime)
             
-            // Print recipe path
-            PrintRecipePath("BFS", bfsResult, store)
+            if err != nil {
+                fmt.Printf("BFS Error: %v\n", err)
+            } else {
+                fmt.Printf("\nBFS found a path with %d steps!\n", len(bfsResult.Path))
+                fmt.Printf("Visited %d nodes during search\n", bfsResult.VisitedNodes)
+                fmt.Printf("Algorithm execution time: %d ms\n", bfsResult.ExecutionTime)
+                fmt.Printf("Total execution time: %v\n", searchDuration)
+                
+                // Print recipe path
+                PrintRecipePath("BFS", bfsResult, store)
+                
+                // Print recipe tree
+                PrintRecipeTree(store, target, bfsResult.Path)
+            }
             
-            // Print recipe tree
-            PrintRecipeTree(store, target, bfsResult.Path)
+        case "2":
+            // Run DFS search
+            fmt.Println("\nRunning DFS search...")
+            startTime := time.Now()
+            dfs := NewDepthFirstFinder(store)
+            dfsResult, err := dfs.FindShortestPath(target)
+            searchDuration := time.Since(startTime)
+            
+            if err != nil {
+                fmt.Printf("DFS Error: %v\n", err)
+            } else {
+                fmt.Printf("\nDFS found a path with %d steps!\n", len(dfsResult.Path))
+                fmt.Printf("Visited %d nodes during search\n", dfsResult.VisitedNodes)
+                fmt.Printf("Algorithm execution time: %d ms\n", dfsResult.ExecutionTime) 
+                fmt.Printf("Total execution time: %v\n", searchDuration)
+                
+                // Print recipe path
+                PrintRecipePath("DFS", dfsResult, store)
+                
+                // Print recipe tree
+                PrintRecipeTree(store, target, dfsResult.Path)
+            }
+            
+        case "3":
+            // Run Bidirectional search
+            fmt.Println("\nRunning Bidirectional search...")
+            startTime := time.Now()
+            bid := NewBidirectionalFinder(store)
+            bidResult, err := bid.FindShortestPath(target)
+            searchDuration := time.Since(startTime)
+            
+            if err != nil {
+                fmt.Printf("Bidirectional Error: %v\n", err)
+            } else {
+                fmt.Printf("\nBidirectional search found a path with %d steps!\n", len(bidResult.Path))
+                fmt.Printf("Visited %d nodes during search\n", bidResult.VisitedNodes)
+                fmt.Printf("Algorithm execution time: %d ms\n", bidResult.ExecutionTime)
+                fmt.Printf("Total execution time: %v\n", searchDuration)
+                
+                // Print recipe path
+                PrintRecipePath("Bidirectional", bidResult, store)
+                
+                // Print recipe tree
+                PrintRecipeTree(store, target, bidResult.Path)
+            }
+            
+        default:
+            fmt.Println("Invalid choice. Please enter 1, 2, or 3.")
+            os.Exit(1)
         }
-        
-    case "2":
-        // Run DFS search
-        fmt.Println("\nRunning DFS search...")
-        startTime := time.Now()
-        dfs := NewDepthFirstFinder(store)
-        dfsResult, err := dfs.FindShortestPath(target)
-        searchDuration := time.Since(startTime)
-        
-        if err != nil {
-            fmt.Printf("DFS Error: %v\n", err)
-        } else {
-            fmt.Printf("\nDFS found a path with %d steps!\n", len(dfsResult.Path))
-            fmt.Printf("Visited %d nodes during search\n", dfsResult.VisitedNodes)
-            fmt.Printf("Algorithm execution time: %d ms\n", dfsResult.ExecutionTime) 
-            fmt.Printf("Total execution time: %v\n", searchDuration)
+    } else {
+        // Multiple recipe paths search
+        switch algoChoice {
+        case "1":
+            // Run BFS search for multiple paths
+            fmt.Printf("\nRunning BFS search for up to %d recipe paths...\n", maxPaths)
+            startTime := time.Now()
+            bfs := NewBreadthFirstFinder(store)
+            bfsResults, err := bfs.FindMultiplePaths(target, maxPaths)
+            searchDuration := time.Since(startTime)
             
-            // Print recipe path
-            PrintRecipePath("DFS", dfsResult, store)
+            if err != nil {
+                fmt.Printf("BFS Error: %v\n", err)
+            } else {
+                fmt.Printf("\nBFS found %d different paths!\n", len(bfsResults))
+                fmt.Printf("Total execution time: %v\n", searchDuration)
+                
+                // Print recipe paths
+                PrintMultipleRecipePaths("BFS", bfsResults, store)
+                
+                // Print recipe tree for the first (shortest) path
+                if len(bfsResults) > 0 {
+                    fmt.Println("\nTree visualization for the first path:")
+                    PrintRecipeTree(store, target, bfsResults[0].Path)
+                }
+            }
             
-            // Print recipe tree
-            PrintRecipeTree(store, target, dfsResult.Path)
+        case "2":
+            // Run DFS search for multiple paths
+            fmt.Printf("\nRunning DFS search for up to %d recipe paths...\n", maxPaths)
+            startTime := time.Now()
+            dfs := NewDepthFirstFinder(store)
+            dfsResults, err := dfs.FindMultiplePaths(target, maxPaths)
+            searchDuration := time.Since(startTime)
+            
+            if err != nil {
+                fmt.Printf("DFS Error: %v\n", err)
+            } else {
+                fmt.Printf("\nDFS found %d different paths!\n", len(dfsResults))
+                fmt.Printf("Total execution time: %v\n", searchDuration)
+                
+                // Print recipe paths
+                PrintMultipleRecipePaths("DFS", dfsResults, store)
+                
+                // Print recipe tree for the first path
+                if len(dfsResults) > 0 {
+                    fmt.Println("\nTree visualization for the first path:")
+                    PrintRecipeTree(store, target, dfsResults[0].Path)
+                }
+            }
+            
+        case "3":
+            // Run Bidirectional search for multiple paths
+            fmt.Printf("\nRunning Bidirectional search for up to %d recipe paths...\n", maxPaths)
+            startTime := time.Now()
+            bid := NewBidirectionalFinder(store)
+            bidResults, err := bid.FindMultiplePaths(target, maxPaths)
+            searchDuration := time.Since(startTime)
+            
+            if err != nil {
+                fmt.Printf("Bidirectional Error: %v\n", err)
+            } else {
+                fmt.Printf("\nBidirectional search found %d different paths!\n", len(bidResults))
+                fmt.Printf("Total execution time: %v\n", searchDuration)
+                
+                // Print recipe paths
+                PrintMultipleRecipePaths("Bidirectional", bidResults, store)
+                
+                // Print recipe tree for the first path
+                if len(bidResults) > 0 {
+                    fmt.Println("\nTree visualization for the first path:")
+                    PrintRecipeTree(store, target, bidResults[0].Path)
+                }
+            }
+            
+        default:
+            fmt.Println("Invalid choice. Please enter 1, 2, or 3.")
+            os.Exit(1)
         }
-        
-    case "3":
-        // Run Bidirectional search
-        fmt.Println("\nRunning Bidirectional search...")
-        startTime := time.Now()
-        bid := NewBidirectionalFinder(store)
-        bidResult, err := bid.FindShortestPath(target)
-        searchDuration := time.Since(startTime)
-        
-        if err != nil {
-            fmt.Printf("Bidirectional Error: %v\n", err)
-        } else {
-            fmt.Printf("\nBidirectional search found a path with %d steps!\n", len(bidResult.Path))
-            fmt.Printf("Visited %d nodes during search\n", bidResult.VisitedNodes)
-            fmt.Printf("Algorithm execution time: %d ms\n", bidResult.ExecutionTime)
-            fmt.Printf("Total execution time: %v\n", searchDuration)
-            
-            // Print recipe path
-            PrintRecipePath("Bidirectional", bidResult, store)
-            
-            // Print recipe tree
-            PrintRecipeTree(store, target, bidResult.Path)
-        }
-        
-    default:
-        fmt.Println("Invalid choice. Please enter 1, 2, or 3.")
-        os.Exit(1)
     }
 }

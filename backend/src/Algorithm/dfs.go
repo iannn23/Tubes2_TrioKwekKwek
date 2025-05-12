@@ -21,7 +21,7 @@ func (df *DepthFirstFinder) FindShortestPath(target string) (*SearchResult, erro
     startTime := time.Now()
 
     // Check target exists
-    _, exists := df.store.Elements[target]
+    _, exists := df.store.Elements[target]  // Remove targetElem
     if !exists {
         return nil, ErrElementNotFound
     }
@@ -52,7 +52,7 @@ func (df *DepthFirstFinder) FindShortestPath(target string) (*SearchResult, erro
         visitedCount++
         
         // Run DFS with depth limit and tier constraints
-        found = df.dfsSearchWithTiers(elem.ID, target, visited, parent, 0, maxDepth, &visitedCount)
+        found = df.dfsSearchWithTiers(elem.ID, target, visited, parent, 0, maxDepth, targetTier, &visitedCount)
         
         if found {
             break
@@ -83,8 +83,13 @@ func (df *DepthFirstFinder) FindShortestPath(target string) (*SearchResult, erro
 }
 
 // DFS search with depth limit and tier constraints
-func (df *DepthFirstFinder) dfsSearchWithTiers(current, target string, visited map[string]bool, 
-    parent map[string]RecipeStep, depth, maxDepth int, visitedCount *int) bool {
+func (df *DepthFirstFinder) dfsSearchWithTiers(
+    current, target string, 
+    visited map[string]bool, 
+    parent map[string]RecipeStep, 
+    depth, maxDepth int,
+    targetTier int,
+    visitedCount *int) bool {
     
     // Check if we found the target
     if current == target {
@@ -100,12 +105,26 @@ func (df *DepthFirstFinder) dfsSearchWithTiers(current, target string, visited m
     currentTier := df.store.GetElementTier(current)
     
     // Get possible recipes using current element that lead to higher tiers
-    possibleRecipes := df.getPossibleRecipesThatRespectTiers(current, currentTier)
+    possibleRecipes := df.getPossibleRecipesThatRespectTiers(current, currentTier, targetTier)
     
     // Try each recipe
     for _, recipe := range possibleRecipes {
         resultElem := recipe.Result
         resultTier := df.store.GetElementTier(resultElem)
+        
+        // Skip if any ingredient in the recipe doesn't respect tier constraint
+        validRecipe := true
+        for _, ingredient := range recipe.Ingredients {
+            ingredientTier := df.store.GetElementTier(ingredient)
+            if ingredientTier >= resultTier {
+                validRecipe = false
+                break
+            }
+        }
+        
+        if !validRecipe {
+            continue
+        }
         
         // Only consider recipes that lead to higher tiers
         if resultTier <= currentTier {
@@ -124,7 +143,7 @@ func (df *DepthFirstFinder) dfsSearchWithTiers(current, target string, visited m
             }
             
             // Recurse deeper
-            if df.dfsSearchWithTiers(resultElem, target, visited, parent, depth+1, maxDepth, visitedCount) {
+            if df.dfsSearchWithTiers(resultElem, target, visited, parent, depth+1, maxDepth, targetTier, visitedCount) {
                 return true
             }
             
@@ -137,90 +156,128 @@ func (df *DepthFirstFinder) dfsSearchWithTiers(current, target string, visited m
     return false
 }
 
-// FindMultiplePaths finds multiple recipe paths
+// FindMultiplePaths finds multiple recipe paths using multithreading
 func (df *DepthFirstFinder) FindMultiplePaths(target string, maxPaths int) ([]*SearchResult, error) {
     // Check target exists
-    _, exists := df.store.Elements[target]
+    _, exists := df.store.Elements[target]  // Remove targetElem
     if !exists {
         return nil, ErrElementNotFound
     }
+    targetTier := df.store.GetElementTier(target)
 
     var results []*SearchResult
     var mutex sync.Mutex
     var wg sync.WaitGroup
 
-    // Limit goroutines
-    maxGoroutines := 4
+    // Limit goroutines based on system capabilities
+    maxGoroutines := 4 // Adjust based on system
     if maxGoroutines > maxPaths {
         maxGoroutines = maxPaths
     }
 
     // Concurrency control
     sem := make(chan bool, maxGoroutines)
+    
+    // First, find the shortest path
+    shortestPath, err := df.FindShortestPath(target)
+    if err != nil {
+        return nil, err
+    }
+    
+    // Add the shortest path to results
+    mutex.Lock()
+    results = append(results, shortestPath)
+    mutex.Unlock()
+    
+    // Track paths we've already found to avoid duplicates
+    pathSignatures := make(map[string]bool)
+    pathSignatureMutex := sync.Mutex{}
+    
+    // Add signature of first path
+    if len(shortestPath.Path) > 0 {
+        sig := getPathSignature(shortestPath.Path)
+        pathSignatureMutex.Lock()
+        pathSignatures[sig] = true
+        pathSignatureMutex.Unlock()
+    }
 
-    // Start multiple searches with different depth limits
-    for i := 0; i < maxPaths; i++ {
+    // Start multiple searches with different depth limits and starting elements
+    for i := 0; i < maxPaths-1; i++ {
         wg.Add(1)
         sem <- true
-
+        
         go func(index int) {
             defer wg.Done()
             defer func() { <-sem }()
-
-            // Find variation path with different depth or starting points
-            result, err := df.findPathWithVariation(target, index)
-
-            if err == nil {
+            
+            // Find variation path with different depth limits and starting points
+            result, err := df.findPathVariation(target, index, targetTier, pathSignatures, &pathSignatureMutex)
+            
+            if err == nil && result != nil {
                 mutex.Lock()
                 results = append(results, result)
                 mutex.Unlock()
+                
+                // Add path signature to avoid duplicates
+                sig := getPathSignature(result.Path)
+                pathSignatureMutex.Lock()
+                pathSignatures[sig] = true
+                pathSignatureMutex.Unlock()
             }
         }(i)
     }
-
+    
     wg.Wait()
-
+    
     // Check results
     if len(results) == 0 {
         return nil, ErrNoPathFound
     }
-
+    
     return results, nil
 }
 
 // Get recipes using element that respect tier hierarchy
-func (df *DepthFirstFinder) getPossibleRecipesThatRespectTiers(elementID string, currentTier int) []Recipe {
+func (df *DepthFirstFinder) getPossibleRecipesThatRespectTiers(elementID string, currentTier, targetTier int) []Recipe {
     var recipes []Recipe
-
+    
+    // Get all recipes where this element is an ingredient
     for _, recipe := range df.store.Recipes {
+        // Check if the current element is one of the ingredients
+        isIngredient := false
         for _, ingredient := range recipe.Ingredients {
             if ingredient == elementID {
-                // Check if the result tier is higher than current tier
-                resultTier := df.store.GetElementTier(recipe.Result)
-                if resultTier > currentTier {
-                    recipes = append(recipes, recipe)
-                }
+                isIngredient = true
                 break
             }
         }
-    }
-
-    return recipes
-}
-
-// Get all recipes using element (without tier restriction)
-func (df *DepthFirstFinder) getPossibleRecipesWith(elementID string) []Recipe {
-    var recipes []Recipe
-
-    for _, recipe := range df.store.Recipes {
+        
+        if !isIngredient {
+            continue
+        }
+        
+        // Check if ALL ingredients have lower tier than the result
+        resultTier := df.store.GetElementTier(recipe.Result)
+        
+        // Skip if result tier is higher than target tier (avoid going beyond what we need)
+        if resultTier > targetTier {
+            continue
+        }
+        
+        allIngredientsLowerTier := true
         for _, ingredient := range recipe.Ingredients {
-            if ingredient == elementID {
-                recipes = append(recipes, recipe)
+            ingredientTier := df.store.GetElementTier(ingredient)
+            if ingredientTier >= resultTier {
+                allIngredientsLowerTier = false
                 break
             }
         }
+        
+        if allIngredientsLowerTier && resultTier > currentTier {
+            recipes = append(recipes, recipe)
+        }
     }
-
+    
     return recipes
 }
 
@@ -243,17 +300,15 @@ func (df *DepthFirstFinder) reconstructPath(target string, parentMap map[string]
     return path
 }
 
-// Find variant path
-func (df *DepthFirstFinder) findPathWithVariation(target string, variationIndex int) (*SearchResult, error) {
-    // Start search with a different ordering of basic elements or a different depth limit
+// Find variant path with different depth limits and starting points
+func (df *DepthFirstFinder) findPathVariation(
+    target string, 
+    variationIndex int,
+    targetTier int,
+    existingPaths map[string]bool,
+    pathMutex *sync.Mutex) (*SearchResult, error) {
+    
     startTime := time.Now()
-
-    // Check target exists
-    _, exists := df.store.Elements[target]
-    if !exists {
-        return nil, ErrElementNotFound
-    }
-    targetTier := df.store.GetElementTier(target)
 
     // Get basic elements
     basicElements := df.store.GetBasicElements()
@@ -279,7 +334,7 @@ func (df *DepthFirstFinder) findPathWithVariation(target string, variationIndex 
     reorderedElements := make([]*Element, len(basicElements))
     copy(reorderedElements, basicElements)
     
-    // Rotate elements by startElemIndex
+    // Rotate elements to vary the starting point
     if startElemIndex > 0 && len(reorderedElements) > 1 {
         reorderedElements = append(reorderedElements[startElemIndex:], reorderedElements[:startElemIndex]...)
     }
@@ -289,10 +344,43 @@ func (df *DepthFirstFinder) findPathWithVariation(target string, variationIndex 
         visited[elem.ID] = true
         visitedCount++
         
-        // Run DFS with depth limit to find shortest path
-        found = df.dfsSearchWithTiers(elem.ID, target, visited, parent, 0, maxDepth, &visitedCount)
+        // Run DFS with depth limit and tier constraints
+        found = df.dfsVariationSearch(
+            elem.ID, 
+            target, 
+            visited, 
+            parent, 
+            0, 
+            maxDepth, 
+            targetTier, 
+            &visitedCount,
+            variationIndex,
+            existingPaths,
+            pathMutex)
         
         if found {
+            // Build path and check if it's unique
+            path := df.reconstructPath(target, parent)
+            pathSignature := getPathSignature(path)
+            
+            pathMutex.Lock()
+            pathExists := existingPaths[pathSignature]
+            pathMutex.Unlock()
+            
+            // If path already exists, continue searching with the next element
+            if pathExists {
+                found = false
+                // Reset for next element
+                for k := range parent {
+                    delete(parent, k)
+                }
+                for k := range visited {
+                    delete(visited, k)
+                }
+                visited[elem.ID] = true
+                continue
+            }
+            
             break
         }
         
@@ -321,6 +409,93 @@ func (df *DepthFirstFinder) findPathWithVariation(target string, variationIndex 
     }
     
     return result, nil
+}
+
+// DFS variation search to find alternative paths
+func (df *DepthFirstFinder) dfsVariationSearch(
+    current, target string, 
+    visited map[string]bool, 
+    parent map[string]RecipeStep, 
+    depth, maxDepth, targetTier int,
+    visitedCount *int,
+    variationIndex int,
+    existingPaths map[string]bool,
+    pathMutex *sync.Mutex) bool {
+    
+    // Check if we found the target
+    if current == target {
+        return true
+    }
+    
+    // Check depth limit to prevent infinite recursion
+    if depth >= maxDepth {
+        return false
+    }
+    
+    // Get current tier
+    currentTier := df.store.GetElementTier(current)
+    
+    // Get possible recipes using current element that lead to higher tiers
+    possibleRecipes := df.getPossibleRecipesThatRespectTiers(current, currentTier, targetTier)
+    
+    // Add some "randomness" to the recipe order to find different paths
+    if variationIndex > 0 && len(possibleRecipes) > 1 {
+        // Simple shuffle based on variationIndex
+        for i := 0; i < len(possibleRecipes); i++ {
+            swapIndex := (i + variationIndex) % len(possibleRecipes)
+            if swapIndex != i {
+                possibleRecipes[i], possibleRecipes[swapIndex] = possibleRecipes[swapIndex], possibleRecipes[i]
+            }
+        }
+    }
+    
+    // Try each recipe
+    for _, recipe := range possibleRecipes {
+        resultElem := recipe.Result
+        resultTier := df.store.GetElementTier(resultElem)
+        
+        // Skip if any ingredient in the recipe doesn't respect tier constraint
+        validRecipe := true
+        for _, ingredient := range recipe.Ingredients {
+            ingredientTier := df.store.GetElementTier(ingredient)
+            if ingredientTier >= resultTier {
+                validRecipe = false
+                break
+            }
+        }
+        
+        if !validRecipe {
+            continue
+        }
+        
+        // Only consider recipes that lead to higher tiers
+        if resultTier <= currentTier {
+            continue
+        }
+        
+        if !visited[resultElem] {
+            // Mark as visited
+            visited[resultElem] = true
+            *visitedCount++
+            
+            // Record parent
+            parent[resultElem] = RecipeStep{
+                ParentID: current,
+                Recipe:   recipe,
+            }
+            
+            // Recurse deeper
+            if df.dfsVariationSearch(resultElem, target, visited, parent, depth+1, maxDepth, targetTier, visitedCount, variationIndex, existingPaths, pathMutex) {
+                return true
+            }
+            
+            // Backtrack if needed
+            delete(visited, resultElem)
+            delete(parent, resultElem)
+        }
+    }
+    
+    return false
 }
 
 // Create visualization tree
