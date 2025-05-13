@@ -10,25 +10,23 @@ export default function AboutPage() {
       <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-6 max-w-7xl mx-auto px-2">
         <div className="bg-black rounded-lg p-6 shadow-lg border border-green-500 hover:scale-[1.02] transition">
           <h2 className="text-2xl font-bold text-green-300 mb-3">
-            🔎 Breadth-First Search (BFS)
+            Breadth-First Search (BFS)
           </h2>
           <p className="text-sm text-gray-300">ini bfs</p>
         </div>
         <div className="bg-black rounded-lg p-6 shadow-lg border border-green-600 hover:scale-[1.02] transition">
           <h2 className="text-2xl font-bold text-green-300 mb-3">
-            🌱 Depth-First Search (DFS)
+            Depth-First Search (DFS)
           </h2>
           <p className="text-sm text-gray-300">ini dfs</p>
         </div>
         <div className="bg-black rounded-lg p-6 shadow-lg border border-green-700 hover:scale-[1.02] transition">
           <h2 className="text-2xl font-bold text-green-300 mb-3">
-            🔁 Bidirectional Search
+            Bidirectional Search
           </h2>
           <p className="text-sm text-gray-300">ini Bidirectional</p>
         </div>
       </div>
-
-
     </div>
   );
 }

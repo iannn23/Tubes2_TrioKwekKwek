@@ -1,77 +1,95 @@
-"use client";
-
+import React, { useEffect, useState } from "react";
 import ReactFlow, {
   Background,
   Controls,
   MiniMap,
-  useNodesState,
-  useEdgesState,
-  addEdge,
-  Connection,
-  Edge,
   Node,
+  Edge,
 } from "reactflow";
+import dagre from "dagre";
 import "reactflow/dist/style.css";
 
-const initialNodes: Node[] = [
-  {
-    id: "1",
-    position: { x: 0, y: 0 },
-    data: { label: "Brick" },
-    type: "default",
-  },
-  {
-    id: "2",
-    position: { x: -100, y: 100 },
-    data: { label: "Mud" },
-  },
-  {
-    id: "3",
-    position: { x: 100, y: 100 },
-    data: { label: "Fire" },
-  },
-  {
-    id: "4",
-    position: { x: -150, y: 200 },
-    data: { label: "Water" },
-  },
-  {
-    id: "5",
-    position: { x: -50, y: 200 },
-    data: { label: "Earth" },
-  },
-];
+interface RecipeTreeProps {
+  nodes: Node[];
+  edges: Edge[];
+  animationInProgress?: boolean;
+}
 
-const initialEdges: Edge[] = [
-  { id: "e1-2", source: "2", target: "1", animated: true },
-  { id: "e3-1", source: "3", target: "1", animated: true },
-  { id: "e4-2", source: "4", target: "2" },
-  { id: "e5-2", source: "5", target: "2" },
-];
+// Initialize dagre graph for layout
+const dagreGraph = new dagre.graphlib.Graph();
+dagreGraph.setDefaultEdgeLabel(() => ({}));
+const NODE_WIDTH = 180;
+const NODE_HEIGHT = 60;
 
-export default function RecipeTree() {
-  const [nodes, , onNodesChange] = useNodesState(initialNodes);
-  const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
+/**
+ * Applies a top-to-bottom tree layout to nodes and edges
+ */
+const getLayoutedElements = (nodes: Node[], edges: Edge[]) => {
+  dagreGraph.setGraph({ rankdir: "TB" });
 
-  const onConnect = (connection: Connection) =>
-    setEdges((eds) => addEdge(connection, eds));
+  // Set nodes with dimensions
+  nodes.forEach((node) => {
+    dagreGraph.setNode(node.id, { width: NODE_WIDTH, height: NODE_HEIGHT });
+  });
 
+  // Set edges
+  edges.forEach((edge) => {
+    dagreGraph.setEdge(edge.source, edge.target);
+  });
 
+  // Perform layout
+  dagre.layout(dagreGraph);
+
+  // Apply computed positions
+  const layoutedNodes = nodes.map((node) => {
+    const nodeWithPosition = dagreGraph.node(node.id);
+    return {
+      ...node,
+      position: {
+        x: nodeWithPosition.x - NODE_WIDTH / 2,
+        y: nodeWithPosition.y - NODE_HEIGHT / 2,
+      },
+      // Fix position so React Flow doesn't override
+      targetPosition: "top",
+      sourcePosition: "bottom",
+    };
+  });
+
+  return { nodes: layoutedNodes, edges };
+};
+
+const RecipeTree: React.FC<RecipeTreeProps> = ({ nodes, edges }) => {
+  const [layoutedNodes, setLayoutedNodes] = useState<Node[]>([]);
+  const [layoutedEdges, setLayoutedEdges] = useState<Edge[]>([]);
+
+  useEffect(() => {
+    if (nodes.length === 0 || edges.length === 0) {
+      setLayoutedNodes(nodes);
+      setLayoutedEdges(edges);
+      return;
+    }
+
+    const { nodes: ln, edges: le } = getLayoutedElements(nodes, edges);
+    setLayoutedNodes(ln);
+    setLayoutedEdges(le);
+  }, [nodes, edges]);
 
   return (
     <div style={{ width: "100%", height: "600px" }}>
       <ReactFlow
-        nodes={nodes}
-        edges={edges}
-        onNodesChange={onNodesChange}
-        onEdgesChange={onEdgesChange}
-        onConnect={onConnect}
+        nodes={layoutedNodes}
+        edges={layoutedEdges}
         fitView
+        attributionPosition="bottom-left"
       >
+        <Background gap={12} />
         <Controls />
-        <MiniMap />
-        <Background />
+        <MiniMap
+          nodeColor={(node) => (node.type === "target" ? "#10B981" : "#3B82F6")}
+        />
       </ReactFlow>
     </div>
   );
-}
+};
+
+export default RecipeTree;
